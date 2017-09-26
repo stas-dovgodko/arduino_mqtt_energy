@@ -7,6 +7,32 @@
 
 #include <stdint.h>       // needed for uint8_t
 
+
+#include <FIR.h>
+
+
+#define POINTS 100
+
+#define FILTER_TAP_NUM 9
+
+const float filter_taps[FILTER_TAP_NUM] = {
+  0.026085214549372897,
+  -0.04033063114250792,
+  -0.08224462403922411,
+  0.2830979977014956,
+  0.6033082429639794,
+  0.2830979977014956,
+  -0.08224462403922411,
+  -0.04033063114250792,
+  0.026085214549372897
+};
+
+
+volatile FIR fir[10];
+int points = POINTS;
+volatile int8_t data[POINTS][10]; // points from sensors buffer
+//volatile int sdata[100][10]; // points to process
+
 SoftwareSerial ESPserial(19, 18); // RX | TX
 
 /**
@@ -17,7 +43,9 @@ SoftwareSerial ESPserial(19, 18); // RX | TX
    датчик чистую синусоиду выдает 741 - 282  (+-229) +-1В (с 10% запасом +-210 отсчетов) 355В
    на калибровочном 230В RMS амплитуда 255 512+/-0.7183*210 = 512+/-151 = 361..663
 */
-#define READVCC_CALIBRATION_CONST 1097349L
+#define READVCC_CALIBRATION_CONST 1102918L
+
+#define LOOP_INTERVAL_MSECONDS 4000
 
 
 #if defined(__arm__)
@@ -28,28 +56,30 @@ SoftwareSerial ESPserial(19, 18); // RX | TX
 
 #define ADC_COUNTS  (1<<ADC_BITS)
 
-#define AREF_VOLTAGE 4.46
+#define AREF_VOLTAGE 4305 //4460
 
-#define VOLTAGE_CALIBARTION 300
+#define VOLTAGE_CALIBARTION 7 // over 313V max Sin
 #define VOLTAGE_PHASE_SHIFT 1.28
-#define CURRENCY_CALIBARION 29.0 // 30A
+#define CURRENCY_CALIBARION 90.0 // 30A
 
-int points = 100;
-volatile int data[100][10]; // points from sensors buffer
-volatile int sdata[100][10]; // points to process
+
+volatile bool ADC_LOOP;
+
+//volatile int t[100];
 
 double rms[10];
 double trms[10];
 
-int v[200];
-int a[200];
+//int v[100];
+//int a[100];
 
 int width;
 int height;
 volatile int point = 0;
-volatile bool xloop = false;
+volatile int xloop = 0;
+
 volatile bool calc_vcc = true; // Calc vcc first
-volatile long vcc;
+volatile long vcc = 4680;
 
 // LCD Pin
 #define LCD_CS A3
@@ -82,17 +112,9 @@ volatile long vcc;
 Adafruit_TFTLCD tft(LCD_CS, LCD_CD, LCD_WR, LCD_RD, LCD_RESET);
 
 
-
+uint8_t offset = 540;
 
 void setup(void) {
-
-  /*
-    TCCR0A=0b00000011;
-    TCCR0B=0b00000101;
-    OCR0A=0xAF;
-    TIMSK0|=1<<OCIE0A;
-  */
-
   tft.reset();
 
   tft.begin(0x9341);
@@ -107,37 +129,33 @@ void setup(void) {
   ESPserial.begin(9600);
   Serial.begin(115200);          //  setup serial
 
+  vcc = readVcc();
+  offset = (uint8_t)(128 * vcc / AREF_VOLTAGE);
+
+  Serial.print(vcc);
+  Serial.print(" ");
+  Serial.println(offset);
 
   cli();
 
-
-  /*
-    //TCCR0A|=(0<<FOC0A)|(0<<WGM00)|(1<<WGM01);
-    TCCR0A|=(0<<FOC0A)|(0<<WGM00)|(1<<WGM01);
-    //TCCR0B|=(0<<CS02)|(0<<CS01)|(1<<CS00);
-    //TIMSK0|=(1<<OCIE0A)|(0<<TOIE0);
-
-    OCR0A=0xAF;
-    TIMSK0|=1<<OCIE0A;
-  */
-  TCCR1A = 0;// set entire TCCR0A register to 0
-  TCCR1B = 0;// same for TCCR0B
-  TCNT1  = 0;//initialize counter value to 0
-  // set compare match register for near 22khz increments
-  OCR1A = 10;// = (16*10^6) / (22000*64) - 1 (must be <256)
+  // 500ms pooling timer
+  TCCR1A = 0; // set entire TCCR1A register to 0
+  TCCR1B = 0; // same for TCCR1B
+  TCNT1  = 0; // initialize counter value to 0
+  // set compare match register for 2 Hz increments
+  OCR1A = 31249; // = 16000000 / (256 * 2) - 1 (must be <65536)
   // turn on CTC mode
   TCCR1B |= (1 << WGM12);
-  // Set CS01 and CS00 bits for 64 prescaler
-  TCCR1B |= (1 << CS11) | (1 << CS10);
+  // Set CS12, CS11 and CS10 bits for 256 prescaler
+  TCCR1B |= (1 << CS12) | (0 << CS11) | (0 << CS10);
   // enable timer compare interrupt
   TIMSK1 |= (1 << OCIE1A);
 
+
+  // ADC
   ADMUX =  0b01000110; // ‭01000110‬
-
   ADCSRA = 0b10101111;
-
   //ADCSRA=(1<<ADEN)|(1<<ADATE)|(1<<ADPS2)|(1<<ADPS1)|(0<<ADPS1);
-
   ADCSRA &= ~(bit (ADPS0) | bit (ADPS1) | bit (ADPS2)); // clear prescaler bits
   // sampling rate is [ADC clock] / [prescaler] / [conversion clock cycles]
   // for Arduino Uno ADC clock is 16 MHz and a conversion takes 13 clock cycles
@@ -147,224 +165,327 @@ void setup(void) {
   //ADCSRA |= (1 << ADPS2);                     // 16 prescaler for 76.9 KHz
   //ADCSRA |= (1 << ADPS1) | (1 << ADPS0);    // 8 prescaler for 153.8 KHz
 
-  ADCSRA |= (1 << ADATE); // enable auto trigger
+  ADCSRA |= (0 << ADATE); // enable auto trigger
   ADCSRA |= (1 << ADIE);  // enable interrupts when measurement complete
   ADCSRA |= (1 << ADEN);  // enable ADC
   ADCSRA |= (1 << ADSC);  // start ADC measurements
 
-  ADCSRB = 0b01000000;
+  //ADCSRB = 0b01000000;
   //bitWrite(ADCSRA, 6, 1); // Запускаем преобразование установкой бита 6 (=ADSC) в ADCSRA
 
-  //ADCSRB=(1<<ADTS1)|(1<<ADTS0); // Timer/Counter0 Compare Match A
-
+  ADCSRB = (1 << ADTS1) | (1 << ADTS0); // Timer/Counter0 Compare Match A
 
   sei(); // устанавливаем флаг прерывания
-  muxvcc();
+
+
+
+
+  //muxvcc();
+  mux(1);
+}
+
+long readVcc() {
+  // Read 1.1V reference against AVcc
+  // set the reference to Vcc and the measurement to the internal 1.1V reference
+#if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
+  ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+#elif defined (__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__)
+  ADMUX = _BV(MUX5) | _BV(MUX0);
+#elif defined (__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__)
+  ADMUX = _BV(MUX3) | _BV(MUX2);
+#else
+  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+#endif
+
+  ADMUX |= (0 << ADLAR);  // 10bit
+
+  delay(2); // Wait for Vref to settle
+  ADCSRA |= _BV(ADSC); // Start conversion
+  while (bit_is_set(ADCSRA, ADSC)); // measuring
+
+  uint8_t low  = ADCL; // must read ADCL first - it then locks ADCH
+  uint8_t high = ADCH; // unlocks both
+
+  long result = (high << 8) | low;
+
+  result = READVCC_CALIBRATION_CONST / result; // Calculate Vcc (in mV); 1125300 = 1.1*1023*1000
+  return result; // Vcc in millivolts
 }
 
 float FK = 0.1;
-double offset = 512;
-void loop()
-
-{
-  String cmd;
-  if (xloop) {
 
 
+// freq detection vars
+volatile unsigned long v_zero_start[3];
+volatile unsigned long v_zero_last[3];
+volatile unsigned int v_zero_number[3];
+
+// RMS detection vars
+volatile double rms_sum[10], rms_tsum[10];
+volatile int rms_points[10];
 
 
-    // magic with static data. Data locked for modifications
-
-    long F[10]; byte N[10];
-    for (int c = 0; c < 10; c++) {
-
-      int sample; int lastsample = 1024; int middlesample = 512;
-      double sqv = 0, sum = 0, tsum = 0;;
-      double lastFiltered = 0, filtered = 0;         //Filtered_ is the raw analog value minus the DC offset
+volatile unsigned int v_f[3] = {0, 0, 0};
 
 
-      short acc_x_raw, acc_x, acc_xf;
-
-      int b; double alfa = 0.3;
-      // low filter
-      /*for(b=1; b<points; b++)
-        {
-           sdata[b][c]=sdata[b-1][c]*alfa+sdata[b][c]*(1.-alfa);
-        }*/
-
-      F[c] = 0; N[c] = 0;
-      long T = 0L; bool crossed = false; int startsins = 0; int endsins = points - 1;
-      for (b = 0; b < points; b++)
-      {
-        lastFiltered = filtered;
-
-        sample = sdata[b][c];
-
-        // llok for crossing
-        if (b > 0) {
-          if (sample > middlesample) {
-            if (crossed) {
-              T += 1000;
-            } else if (lastsample <= middlesample) {
-              T = double(1000 * double(sample - middlesample) / double(sample - lastsample));
-              crossed = true;
-
-              if (startsins == 0) startsins = b;
-              endsins = b;
-            }
-          } else if (sample < middlesample) {
-            if (crossed) {
-              T += double(1000 * double(lastsample - middlesample) / double(lastsample - sample));
-              crossed = false;
-
-              if (N[c] > 0) {
-                F[c] += 100000000000 / (120.39 * T * 2);
-              }
-              N[c]++;
-
-            }
-          }
-        }
-        lastsample = sample;
-      }
-
-      if ((endsins - startsins) < 0.8 * points) {
-        startsins = 0; endsins = points - 1;
-      }
-
-      /*if (c == 0) {
-            Serial.print("b - ");
-            Serial.print(startsins);
-            Serial.print(" - ");
-            Serial.println(endsins);
-        }*/
-
-      int usedpoints = 0;
-      for (b = 0; b < points; b++)
-      {
-        sample = sdata[b][c];
-        filtered = sample;// - offset;
-
-        if (c == 0) {
-
-          v[b] = filtered;
-        } else if (c == 3) {
-          a[b] = filtered;
-          //Serial.println(sample);
-        }
-
-        if ((b >= startsins) && (b < endsins)) {
-          usedpoints++;
+//volatile int value10;
+//volatile int locked;
 
 
-          tsum += abs(filtered);
-          sqv = filtered * filtered;                 //1) square voltage values
-          sum += sqv;
-        }
-      }
-
-      if (usedpoints > 0) {
-        double V_RATIO = VOLTAGE_CALIBARTION * ((vcc / 1000.0) / (ADC_COUNTS));
-        rms[c] = V_RATIO * sqrt(sum / usedpoints);
-        trms[c] = V_RATIO * 1.11 * (tsum / usedpoints);
-
-        if ((c == 0) || (c == 3)) {
-          cmd = "mqtt-publish test/rms_" + String(c) + " " + String(rms[c]);
-          ESPserial.println(cmd);
-
-          cmd = "mqtt-publish test/trms_" + String(c) + " " + String(trms[c]);
-          ESPserial.println(cmd);
-
-          cmd = "mqtt-publish test/vq_" + String(c) + " " + String(trms[c] / (trms[c] + abs(rms[c] - trms[c])));
-          ESPserial.println(cmd);
-
-          Serial.print("T - ");
-          Serial.println(F[c] / (N[c] - 1));
-        }
-      }
-    }
-
-    graph();
-    //delay(500);
-
-
-    xloop = false; // release lock
-    muxvcc();
-    set_sleep_mode( SLEEP_MODE_ADC );
-    sleep_enable();
-  }
-}
-
-volatile int value;
-volatile int value10;
-volatile int locked;
-ISR(ADC_vect)
-{
-  value = ADC;// / 4;
-  if (locked < 255) locked++;
-
-
-}
+volatile bool pool_is_locked;
 
 ISR(TIMER1_COMPA_vect)
 {
-  int lockedvalue;
-  static uint8_t n = 0; static uint8_t p = 0;
-  vcc = 5;
-  if (calc_vcc && locked > 10) {
-      vcc = READVCC_CALIBRATION_CONST / value;
-      locked = 0;
-      mux(++n);
+  // graph timer
 
-      offset = 5120 * vcc / AREF_VOLTAGE;
-  } else if (!calc_vcc && locked > 2) { // delay to MUX
-      data[p][n - 1] = value;
-      locked = 0;
+  if (!ADC_LOOP) {
+    // stop ADC per graph cicle
+    stop_ADC();
 
-      uint8_t next_n = n + 1;
-      if (next_n > 10) next_n = 1;
+    //process();
 
-      mux(next_n); // switch to next MUX
+    graph();
 
-      if ((next_n == 1) && ++p >= points) {
-        p = 0;
-        if (!xloop) {
-          
-          memcpy( sdata, data, points * 2 * 10 );
+    // release lock and start ADC
+    ADC_LOOP = true;
+    xloop = 0;
+    start_ADC();
 
-          xloop = true;
-          // No more sleeping
-          sleep_disable();
-        }
-      }
-
-      n = next_n;
+  } else {
+    xloop += 500; // 500ms tick
   }
 }
 
-void muxvcc()
+void loop()
 {
-  ADMUX = 0b01011110; ADCSRB &= ~_BV(MUX5);
-  calc_vcc = true;
+
+
+
 }
+
+volatile uint8_t n = 0;
+volatile int p = 0;
+
+unsigned long adc_start_micros, adc_end_micros;
+
+void start_ADC()
+{
+  // RESET
+  for (int c = 0; c < 10; c++) {
+    fir[c] = FIR(0.8, filter_taps);
+
+    if (c < 3) {
+      v_zero_number[c] = 0;
+      v_zero_start[c] = 0;
+      //v_zero_start[c] = micros();
+    }
+
+    rms_points[c] = 0;
+    rms_sum[c] = 0;
+    rms_tsum[c] = 0;
+  }
+
+  n = 0; p = 0; // adc_start_micros = 0; adc_end_micros = 0;
+  ADCSRA |= (1 << ADEN);  // enable ADC
+  mux(1);
+  set_sleep_mode( SLEEP_MODE_ADC );
+  sleep_enable();
+
+}
+
+void stop_ADC()
+{
+  ADCSRA |= (0 << ADEN);  // disable ADC
+  ADCSRA |= (0 << ADSC);  // stop ADC measurements
+
+
+
+  // No more sleeping
+  sleep_disable();
+
+  for (int c = 0; c < 3; c++) {
+
+    // calc v-F(Hz)
+    if (v_zero_number[c] > 1) {
+      v_f[c] = (1000000 * (v_zero_number[c] - 1)) / ((v_zero_last[c] - v_zero_start[c]) / 1000);
+
+      Serial.print("Frequency V");
+      Serial.print((c + 1));
+      Serial.print(": ");
+      Serial.print((float)v_f[c] / 1000);
+      Serial.print(" @ ");
+      Serial.print(v_zero_number[c]);
+      Serial.println(" Hz");
+    }
+
+    if (rms_points[c] > 0) {
+      //double V_RATIO = VOLTAGE_CALIBARTION;
+      rms[c] = VOLTAGE_CALIBARTION * sqrt(rms_sum[c] / rms_points[c]);
+      trms[c] = VOLTAGE_CALIBARTION * 1.11 * (rms_tsum[c] / rms_points[c]);
+
+      /*Serial.print("RMS points ");
+        Serial.print((c+1));
+        Serial.print(": ");
+        Serial.println(rms_points[c]);*/
+      Serial.print("V(RMS)");
+      Serial.print((c + 1));
+      Serial.print(": ");
+      Serial.println(rms[c]);
+
+      Serial.print("V");
+      Serial.print((c + 1));
+      Serial.print(": ");
+      Serial.println(trms[c]);
+      /*
+
+        if ((c == 0) || (c == 3)) {
+        String cmd;
+
+
+
+        cmd = "mqtt-publish test/rms_" + String(c) + " " + String(rms[c]);
+        ESPserial.println(cmd);
+
+        cmd = "mqtt-publish test/trms_" + String(c) + " " + String(trms[c]);
+        ESPserial.println(cmd);
+
+        cmd = "mqtt-publish test/vq_" + String(c) + " " + String(trms[c] / (trms[c] + abs(rms[c] - trms[c])));
+        ESPserial.println(cmd);
+
+        Serial.print("T - ");
+        Serial.println(F[c] / (N[c] - 1));
+        }*/
+    }
+  }
+
+  for (int c = 3; c < 10; c++) {
+
+    if (rms_points[c] > 0) {
+      //double V_RATIO = VOLTAGE_CALIBARTION;
+      rms[c] = CURRENCY_CALIBARION * sqrt(rms_sum[c] / rms_points[c]);
+      //trms[c] = CURRENCY_CALIBARION * 1.11 * (rms_tsum[c] / rms_points[c]);
+
+      /*Serial.print("RMS points ");
+        Serial.print((c+1));
+        Serial.print(": ");
+        Serial.println(rms_points[c]);*/
+      Serial.print("I(RMS)");
+      Serial.print((c - 2));
+      Serial.print(": ");
+      Serial.println(rms[c]);
+
+      /*Serial.print("I");
+        Serial.print((c-2));
+        Serial.print(": ");
+        Serial.println(trms[c]);
+      */
+    }
+  }
+}
+
+
+
+ISR(ADC_vect, ISR_BLOCK)
+{
+
+  uint8_t  value = ADCH;
+  unsigned long microseconds = micros();
+  uint8_t channel = n - 1;
+
+  //uint8_t next_n = n + 1;
+
+  //if (next_n > 10) {
+  if (++n > 10) {
+    //next_n = 1;
+    n = 1;
+    if (++p >= POINTS) {
+      p = 1;
+      if (xloop > LOOP_INTERVAL_MSECONDS) {
+        ADC_LOOP = false;
+        return;
+      }
+    }
+  }
+
+  //mux(next_n); // switch to next MUX
+  mux(n); // switch to next MUX
+
+
+
+  int lockedvalue; bool crossed_up; bool crossed_down;
+  static int lastvalue[10];
+
+
+
+
+
+
+  lockedvalue = (uint8_t)value - offset;
+
+
+  //if (channel < 3) {
+  //lockedvalue = filtersin(lockedvalue, channel);
+  //}
+
+  // zero-cross detect
+  if ((lockedvalue < 0) && (lastvalue[channel] >= 0)) {
+    crossed_up = false; crossed_down = true;
+  } else if ((lockedvalue > 0) && (lastvalue[channel] <= 0)) {
+    crossed_up = true; crossed_down = false;
+  } else {
+    crossed_up = false; crossed_down = false;
+  }
+
+  lastvalue[channel] = lockedvalue;
+
+
+
+
+
+  data[p - 1][channel] = lockedvalue;
+
+
+  if (channel < 3) { // Voltages (sin quality + F)
+    rms_tsum[channel] += abs(lockedvalue);
+
+    if (crossed_up) {
+      if (v_zero_number[channel]++ == 0) {
+        v_zero_start[channel] = microseconds;
+      }
+      v_zero_last[channel] = microseconds;
+    }
+  }
+
+  rms_sum[channel] += lockedvalue * lockedvalue;
+  rms_points[channel]++;
+
+  //n = next_n;
+
+}
+
+int filtersin(int v, int c)
+{
+  float vzeroed = (float)v;
+
+  return (int)(fir[c].process(vzeroed));
+}
+
 
 void mux(uint8_t n)
 {
-  locked = 0;
-  calc_vcc = false;
 
-  uint8_t chan;
   switch (n) {
     case 1:
     case 2:
     case 3:
       // V(n)
-      ADMUX = 0b00000110; // n+5
+      ADMUX = 0b00100110; // n+5
       ADCSRB &= ~_BV(MUX5);
       break;
     case 4:
+      uint8_t chan;
       chan = 0x09 & ~0x08;
-      ADMUX = 0b00000001; // n-3
+      ADMUX = 0b00100001; // n-3
       ADCSRB |= _BV(MUX5);
       break;
     case 5:
@@ -374,11 +495,12 @@ void mux(uint8_t n)
     case 9:
     case 10:
       // A(n)
-      ADMUX = 0b00001001;
+      ADMUX = 0b00101001;
       ADCSRB &= ~_BV(MUX5);
       break;
   }
-  locked = 0;
+
+  ADCSRA |= (1 << ADSC);  // start ADC measurements
 }
 
 void graph()
@@ -388,6 +510,7 @@ void graph()
   tft.fillScreen(WHITE);
 
   graphV();
+  //graphV2();
   //graphA();
 
   //Serial.println(vcc);
@@ -399,40 +522,66 @@ void graph()
 
 void graphV()
 {
-
+  Serial.println("DRAW V");
   int s = 0; int b = 0;
-  int vmin = 1000; int vmax = 0;  int vv = 0; int pc = 0; int vvd = 0;
-  int drawpoints = 50;
-  int xoffset = offset / 10000; // ?
-  for (b = 0; b < drawpoints; b++) {
+  int vmin = 1000; int vmax = 0;  unsigned int vv = 0; int pc = 0; int vvd = 0;
+  int drawpoints = 100;
+  int xoffset = offset; // ?
+  float flired = 0;
+  float firin;
+
+  /*for (b = 0; b < drawpoints; b++) {
     vv = v[b];
+
+
+
+
     //if (vv > 0) {
     vmin = min(vv, vmin);
     vmax = max(vv, vmax);
     s += vv; pc++;
     //}
 
-    xoffset = (xoffset + (vv - xoffset) / drawpoints);
-  }
+    //xoffset = (xoffset + (vv - xoffset) / drawpoints);
 
-  Serial.print("offset 2: ");
-  Serial.println(xoffset);
 
-  int vavg = s / pc;
-  //vmin = 0; vmax = 255;
+    }
 
+    for (b = 1; b < 100; b++) {
+    //Serial.println(t[b]);
+    }
+
+    //Serial.print("offset 2: ");
+    //Serial.println(xoffset);
+
+
+    int vavg = s / pc;
+
+    vmin = 0; vmax = 255;
+  */
 
   tft.drawLine(0, 0, width, 0, BLACK);
   tft.drawLine(0, 100, width, 100, BLACK);
   tft.drawLine(0, 200, width, 200, BLACK);
 
-  int pw = ((width - 15 - 30) * 100 / drawpoints); vv = 0; int x = 0; int y = 0; int prevx = 0; int prevy = 0; int prevxd = 0; int prevyd = 0; double alfa = 1.5;
+  int pw = ((width - 15 - 30) * 100 / drawpoints); vv = 0; int x = 0; int y = 0; int prevx = 0; int prevy = 100; int prevxd = 0; int prevyd = 0; double alfa = 1.5;
+
+  unsigned int vzeroed;
   for (b = 0; b < drawpoints; b++) {
 
     //xoffset = (xoffset + (v[b] - xoffset)/1024);
 
-    //vv = map(v[b], vmin, vmax, 0, 200);
-    vv = (v[b] - xoffset) / 3 + 100; //(v[b] * 200)/1024;
+    vv = map(data[b][0], -128, 127, 0, 200);
+    //vzeroed = data[b][0];//(v[b] - xoffset);
+
+    //flired = fir.process(vzeroed)*(-64);
+
+    //vv = flired / 3 + 100; //(v[b] * 200)/1024;
+    //vv = (v[b] - xoffset) / 3 + 100; //(v[b] * 200)/1024;
+    //vv = vzeroed + 100; //(v[b] * 200)/1024;
+
+
+
     //Serial.println(vv);
     x = (b * pw) / 100 + 1; y = vv;
     //
@@ -454,29 +603,61 @@ void graphV()
   tft.println(vmin);
 }
 
-void graphA()
+void graphV2()
 {
+
   int s = 0; int b = 0;
   int vmin = 1000; int vmax = 0;  int vv = 0; int pc = 0; int vvd = 0;
-  int drawpoints = 50;
-  for (b = 0; b < drawpoints; b++) {
-    vv = a[b];
+  int drawpoints = 100;
+  int xoffset = offset; // ?
+  float flired = 0;
+  float firin;
+
+  /*for (b = 0; b < drawpoints; b++) {
+    vv = v[b];
+
+
+
+
     //if (vv > 0) {
     vmin = min(vv, vmin);
     vmax = max(vv, vmax);
     s += vv; pc++;
     //}
-  }
-  int vavg = s / pc;
+
+    //xoffset = (xoffset + (vv - xoffset) / drawpoints);
 
 
+    }
+
+    for (b = 1; b < 100; b++) {
+    //Serial.println(t[b]);
+    }
+
+    //Serial.print("offset 2: ");
+    //Serial.println(xoffset);
 
 
-  int pw = ((width - 15 - 30) * 100 / drawpoints); vv = 0; int x = 0; int y = 0; int prevx = 0; int prevy = 0; int prevxd = 0; int prevyd = 0; double alfa = 1.5;
+    int vavg = s / pc;
+
+    //vmin = 0; vmax = 255;
+  */
+
+  //tft.drawLine(0, 0, width, 0, BLACK);
+  //tft.drawLine(0, 100, width, 100, BLACK);
+  //tft.drawLine(0, 200, width, 200, BLACK);
+
+  int pw = ((width - 15 - 30) * 100 / drawpoints); vv = 0; int x = 0; int y = 0; int prevx = 0; int prevy = 100; int prevxd = 0; int prevyd = 0; double alfa = 1.5;
+
+  float vzeroed;
   for (b = 0; b < drawpoints; b++) {
 
 
-    vv = map(a[b], vmin, vmax, 0, 200);
+    vv = (data[b][3]) + 100; //(v[b] * 200)/1024;
+
+
+
+    //Serial.println(vv);
     x = (b * pw) / 100 + 1; y = vv;
     //
 
@@ -486,14 +667,7 @@ void graphA()
     prevx = x; prevy = y;
   }
 
-  tft.fillRect(width - 42, 45, 40, 65, WHITE);
-  tft.setCursor(width - 40, 145);
-  tft.setTextSize(2);
-  tft.println(vmax);
-  tft.setCursor(width - 40, 169);
-  tft.println(rms[3]);
-  tft.setCursor(width - 40, 192);
-  tft.setTextSize(2);
-  tft.println(vmin);
+
 }
+
 
